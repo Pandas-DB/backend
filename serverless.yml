@@ -9,6 +9,12 @@ provider:
   environment:
     METADATA_TABLE: ${self:service}-${self:provider.stage}
     CHUNK_SIZE: 100000
+    AWS_REGION: ${self:provider.region}  # Added for bucket creation
+    POWERTOOLS_SERVICE_NAME: ${self:service}  # For Lambda Powertools
+    LOG_LEVEL: INFO
+  
+  httpApi:
+    cors: true  # Enable CORS for all endpoints
     
   iam:
     role:
@@ -29,6 +35,9 @@ provider:
             - s3:GetObject
             - s3:ListBucket
             - s3:DeleteObject
+            - s3:ListObjects
+            - s3:ListObjectsV2
+            - s3:HeadBucket
           Resource:
             - "arn:aws:s3:::df-*"
             - "arn:aws:s3:::df-*/*"
@@ -45,19 +54,23 @@ layers:
     compatibleRuntimes:
       - python3.9
 
+package:
+  patterns:
+    - '!node_modules/**'
+    - '!package*.json'
+    - '!requirements.txt'
+    - '!layer/**'
+    - 'handlers/**/*.py'
+    - '!.serverless/**'
+    - '!.git/**'
+
 functions:
   uploadDataFrame:
     handler: handlers/dataframes.upload
-    timeout: 900  # 15 minutes for large files
-    memorySize: 3008  # Max memory for processing
+    timeout: 900
+    memorySize: 3008
     layers:
       - {Ref: DependenciesLambdaLayer}
-    package:
-      patterns:
-        - '!node_modules/**'
-        - '!package*.json'
-        - '!requirements.txt'
-        - '!layer/**'
     events:
       - http:
           path: dataframes/upload
@@ -66,6 +79,8 @@ functions:
             type: COGNITO_USER_POOLS
             authorizerId: !Ref ApiGatewayAuthorizer
           cors: true
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-upload
 
   getDataFrame:
     handler: handlers/dataframes.get
@@ -73,12 +88,6 @@ functions:
     memorySize: 3008
     layers:
       - {Ref: DependenciesLambdaLayer}
-    package:
-      patterns:
-        - '!node_modules/**'
-        - '!package*.json'
-        - '!requirements.txt'
-        - '!layer/**'
     events:
       - http:
           path: dataframes/{name}
@@ -89,17 +98,13 @@ functions:
           cors: true
           request:
             parameters:
+              paths:
+                name: true
               querystrings:
                 external_key: false
                 use_last: false
-
-package:
-  individually: true
-  patterns:
-    - '!node_modules/**'
-    - '!package*.json'
-    - '!requirements.txt'
-    - '!layer/**'
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-get
 
 resources:
   Resources:
@@ -112,22 +117,11 @@ resources:
             AttributeType: S
           - AttributeName: df_path
             AttributeType: S
-          - AttributeName: created_at
-            AttributeType: S
         KeySchema:
           - AttributeName: user_id
             KeyType: HASH
           - AttributeName: df_path
             KeyType: RANGE
-        GlobalSecondaryIndexes:
-          - IndexName: CreatedAtIndex
-            KeySchema:
-              - AttributeName: user_id
-                KeyType: HASH
-              - AttributeName: created_at
-                KeyType: RANGE
-            Projection:
-              ProjectionType: ALL
         BillingMode: PAY_PER_REQUEST
         
     CognitoUserPool:
