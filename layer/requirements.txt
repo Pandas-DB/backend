@@ -1,7 +1,0 @@
-pandas
-numpy
-pyarrow
-aws-lambda-powertools
-boto3
-nest-asyncio
-aiofiles

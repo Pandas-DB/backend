@@ -4,17 +4,17 @@ provider:
   name: aws
   runtime: python3.9
   stage: ${opt:stage, 'dev'}
-  region: ${opt:region, 'eu-west-1'}
+  region: ${opt:region, 'us-east-1'}
   
   environment:
     METADATA_TABLE: ${self:service}-${self:provider.stage}
     CHUNK_SIZE: 100000
-    DEPLOYMENT_REGION: ${self:provider.region}  # Added for bucket creation
-    POWERTOOLS_SERVICE_NAME: ${self:service}  # For Lambda Powertools
+    POWERTOOLS_SERVICE_NAME: ${self:service}
     LOG_LEVEL: INFO
+    DEPLOYMENT_REGION: ${self:provider.region}
   
   httpApi:
-    cors: true  # Enable CORS for all endpoints
+    cors: true
     
   iam:
     role:
@@ -47,6 +47,22 @@ provider:
             - cognito-idp:AdminCreateUser
           Resource: "arn:aws:cognito-idp:${self:provider.region}:*:userpool/*"
 
+package:
+  individually: true
+  patterns:
+    - "!node_modules/**"
+    - "!.git/**"
+    - "!.venv/**"
+    - "!__pycache__/**"
+    - "!.pytest_cache/**"
+    - "!test/**"
+    - "!tests/**"
+    - "!*.pyc"
+    - "!.DS_Store"
+    - "!**.sample"
+    - "!layer/**"
+    - "handlers/**/*.py"
+
 layers:
   dependencies:
     path: layer
@@ -54,21 +70,14 @@ layers:
     compatibleRuntimes:
       - python3.9
 
-package:
-  patterns:
-    - '!node_modules/**'
-    - '!package*.json'
-    - '!requirements.txt'
-    - '!layer/**'
-    - 'handlers/**/*.py'
-    - '!.serverless/**'
-    - '!.git/**'
-
 functions:
   uploadDataFrame:
     handler: handlers/dataframes.upload
     timeout: 900
     memorySize: 3008
+    package:
+      patterns:
+        - "handlers/dataframes.py"
     layers:
       - {Ref: DependenciesLambdaLayer}
     events:
@@ -86,6 +95,9 @@ functions:
     handler: handlers/dataframes.get
     timeout: 900
     memorySize: 3008
+    package:
+      patterns:
+        - "handlers/dataframes.py"
     layers:
       - {Ref: DependenciesLambdaLayer}
     events:
