@@ -33,7 +33,7 @@ class DataFrameStorage:
             self.s3.create_bucket(
                 Bucket=self.bucket,
                 CreateBucketConfiguration={
-                    'LocationConstraint': os.environ['AWS_REGION']
+                    'LocationConstraint': os.environ['DEPLOYMENT_REGION']
                 }
             )
 
