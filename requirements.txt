@@ -1,0 +1,5 @@
+pandas==2.0.0
+numpy==1.24.3
+boto3==1.26.137
+aws-lambda-powertools==2.15.0
+python-multipart==0.0.6
