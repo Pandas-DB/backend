@@ -13,7 +13,7 @@ provider:
     LOG_LEVEL: INFO
     DEPLOYMENT_REGION: ${self:provider.region}
   
-  httpApi:
+  http:
     cors: true
     
   iam:
@@ -118,6 +118,45 @@ functions:
     environment:
       POWERTOOLS_METRICS_NAMESPACE: ${self:service}-get
 
+  getAuthConfig:
+    handler: handlers/auth.get_config
+    timeout: 30
+    memorySize: 128
+    package:
+      patterns:
+        - "handlers/auth.py" 
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-auth
+    events:
+      - http:
+          path: auth/config
+          method: get
+          cors: true
+
+  verifyToken:
+    handler: handlers/auth.verify_token
+    timeout: 30
+    memorySize: 128
+    package:
+      patterns:
+        - "handlers/auth.py"
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-auth
+    events:
+      - http:
+          path: auth/verify
+          method: get
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+          cors: true
+
 resources:
   Resources:
     MetadataTable:
@@ -150,6 +189,9 @@ resources:
         ExplicitAuthFlows:
           - ALLOW_USER_PASSWORD_AUTH
           - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        PreventUserExistenceErrors: ENABLED
+
           
     ApiGatewayAuthorizer:
       Type: AWS::ApiGateway::Authorizer
