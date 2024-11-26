@@ -12,8 +12,8 @@ from pathlib import Path
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
-from aws_lambda_powertools.utilities.parser import parse_qs
-
+from urllib.parse import parse_qs  # Changed this line
+ 	
 logger = Logger()
 tracer = Tracer()
 
@@ -232,22 +232,64 @@ class DataFrameStorage:
 
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
-async def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
+def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
     try:
+        # Add debug logging
+        logger.debug("Received upload request")
+        logger.debug(f"Event: {json.dumps(event)}")
+        
+        # Verify auth claims exist
+        if 'authorizer' not in event.get('requestContext', {}) or \
+           'claims' not in event['requestContext']['authorizer']:
+            logger.error("Missing authorization claims")
+            return {
+                'statusCode': 401,
+                'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'Unauthorized - missing claims'})
+            }
+
         user_id = event['requestContext']['authorizer']['claims']['sub']
         bucket_name = f"df-{user_id}"
         storage = DataFrameStorage(bucket_name)
         
-        # Parse request
-        body = json.loads(event['body'])
-        df = pd.read_json(body['dataframe'])
+        # Parse and validate request body
+        if not event.get('body'):
+            raise ValueError("Missing request body")
+            
+        try:
+            body = json.loads(event['body'])
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in request body: {e}")
+            raise ValueError("Invalid JSON in request body")
+
+        # Log received data
+        logger.debug(f"Received body: {body}")
+        
+        # Validate required fields
+        if 'dataframe' not in body:
+            raise ValueError("Missing 'dataframe' in request")
+        if 'dataframe_name' not in body:
+            raise ValueError("Missing 'dataframe_name' in request")
+            
+        # Parse DataFrame
+        try:
+            df = pd.read_json(body['dataframe'])
+        except Exception as e:
+            logger.error(f"Error parsing DataFrame: {e}")
+            raise ValueError(f"Invalid DataFrame format: {str(e)}")
+            
         df_name = body['dataframe_name']
         columns_keys = body.get('columns_keys', {})
         external_key = body.get('external_key', 'NOW')
         keep_last = body.get('keep_last', False)
         
+        # Log processing details
+        logger.debug(f"Processing DataFrame with shape: {df.shape}")
+        logger.debug(f"DataFrame name: {df_name}")
+        logger.debug(f"Columns keys: {columns_keys}")
+        
         # Store dataframe
-        metadata = await storage.store_dataframe(
+        metadata = storage.store_dataframe(
             user_id,
             df,
             df_name,
@@ -265,6 +307,13 @@ async def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[st
             'body': json.dumps(metadata)
         }
         
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        return {
+            'statusCode': 400,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': str(e)})
+        }
     except Exception as e:
         logger.exception("Error in upload handler")
         return {
