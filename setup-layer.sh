@@ -17,6 +17,7 @@ pip install \
     pyarrow==12.0.1 \
     aiofiles \
     nest-asyncio \
+    pydantic \
     -t layer/python \
     --platform manylinux2014_x86_64 \
     --implementation cp \

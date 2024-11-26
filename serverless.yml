@@ -102,11 +102,12 @@ functions:
       - {Ref: DependenciesLambdaLayer}
     events:
       - http:
-          path: dataframes/{name}
+          path: dataframes/get/{name}
           method: get
           authorizer:
             type: COGNITO_USER_POOLS
             authorizerId: !Ref ApiGatewayAuthorizer
+            identitySource: method.request.header.Authorization
           cors: true
           request:
             parameters:
@@ -115,6 +116,7 @@ functions:
               querystrings:
                 external_key: false
                 use_last: false
+          integration: LAMBDA_PROXY
     environment:
       POWERTOOLS_METRICS_NAMESPACE: ${self:service}-get
 

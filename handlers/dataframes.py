@@ -12,8 +12,8 @@ from pathlib import Path
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
-from aws_lambda_powertools.utilities.parser import parse_qs
-
+from urllib.parse import unquote
+ 	
 logger = Logger()
 tracer = Tracer()
 
@@ -67,28 +67,36 @@ class DataFrameStorage:
             'created_at': datetime.utcnow().isoformat()
         })
 
-    async def store_dataframe(
-        self,
-        user_id: str,
-        df: pd.DataFrame,
-        df_name: str,
-        columns_keys: Dict[str, str],
-        external_key: str = 'NOW',
-        keep_last: bool = False
+    def store_dataframe(
+            self,
+            user_id: str,
+            df: pd.DataFrame,
+            df_name: str,
+            columns_keys: Dict[str, str],
+            external_key: str = 'NOW',
+            keep_last: bool = False
     ) -> Dict[str, Any]:
         """Store DataFrame with versioning support"""
-        self.ensure_bucket_exists()
-        stored_paths = []
-        metadata = {
-            'df_name': df_name,
-            'columns_keys': columns_keys,
-            'external_key': external_key,
-            'keep_last': keep_last,
-            'total_rows': len(df),
-            'chunks': []
-        }
-
         try:
+            logger.debug(f"Starting store_dataframe for user {user_id}")
+            logger.debug(f"DataFrame shape: {df.shape}")
+            logger.debug(f"DataFrame name: {df_name}")
+            logger.debug(f"Columns keys: {columns_keys}")
+
+            self.ensure_bucket_exists()
+            logger.debug(f"Bucket {self.bucket} exists")
+
+            stored_paths = []
+            metadata = {
+                'df_name': df_name,
+                'columns_keys': columns_keys,
+                'external_key': external_key,
+                'keep_last': keep_last,
+                'total_rows': len(df),
+                'chunks': []
+            }
+            logger.debug(f"Created metadata: {metadata}")
+
             # Generate base paths
             if external_key == 'NOW':
                 now = datetime.utcnow()
@@ -100,6 +108,9 @@ class DataFrameStorage:
                 base_path = f"{df_name}/external_key/{external_key}"
                 version_path = str(uuid.uuid4())
 
+            logger.debug(f"Base path: {base_path}")
+            logger.debug(f"Version path: {version_path}")
+
             # Handle keep_last logic
             if keep_last:
                 try:
@@ -109,20 +120,27 @@ class DataFrameStorage:
                         Key=last_key_path
                     )
                     last_version = response['Body'].read().decode('utf-8')
-                    
+                    logger.debug(f"Found last version: {last_version}")
+
                     # Delete previous version
                     self._delete_version(last_version)
                 except self.s3.exceptions.NoSuchKey:
+                    logger.debug("No previous version found")
                     pass
 
             # Store chunks
             full_path = f"{base_path}/{version_path}"
-            for i, chunk_df in enumerate(np.array_split(df, max(1, len(df) // self.chunk_size))):
+            chunks = np.array_split(df, max(1, len(df) // self.chunk_size))
+            logger.debug(f"Split DataFrame into {len(chunks)} chunks")
+
+            for i, chunk_df in enumerate(chunks):
                 chunk_id = str(uuid.uuid4())
                 chunk_path = self._generate_chunk_path(full_path, chunk_id)
-                
+                logger.debug(f"Storing chunk {i + 1}/{len(chunks)} at {chunk_path}")
+
                 self.store_chunk(chunk_df, chunk_path)
-                
+                logger.debug(f"Successfully stored chunk {i + 1}")
+
                 metadata['chunks'].append({
                     'path': chunk_path,
                     'rows': len(chunk_df),
@@ -131,19 +149,24 @@ class DataFrameStorage:
 
             # Update last_key.txt if keep_last
             if keep_last:
+                last_key_path = f"{base_path}/last_key.txt"
                 self.s3.put_object(
                     Bucket=self.bucket,
-                    Key=f"{base_path}/last_key.txt",
+                    Key=last_key_path,
                     Body=version_path.encode('utf-8')
                 )
+                logger.debug(f"Updated last_key.txt with {version_path}")
 
             # Store metadata in DynamoDB
+            logger.debug("Storing metadata in DynamoDB")
             self._store_metadata(user_id, df_name, metadata)
+            logger.debug("Successfully stored metadata")
 
             return metadata
 
         except Exception as e:
             logger.error(f"Error storing dataframe: {str(e)}")
+            logger.exception("Full traceback:")
             raise
 
     def _delete_version(self, version_path: str) -> None:
@@ -162,7 +185,7 @@ class DataFrameStorage:
         except Exception as e:
             logger.warning(f"Error deleting version: {str(e)}")
 
-    async def get_dataframe(
+    def get_dataframe(
         self,
         user_id: str,
         df_name: str,
@@ -232,22 +255,64 @@ class DataFrameStorage:
 
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
-async def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
+def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
     try:
+        # Add debug logging
+        logger.debug("Received upload request")
+        logger.debug(f"Event: {json.dumps(event)}")
+        
+        # Verify auth claims exist
+        if 'authorizer' not in event.get('requestContext', {}) or \
+           'claims' not in event['requestContext']['authorizer']:
+            logger.error("Missing authorization claims")
+            return {
+                'statusCode': 401,
+                'headers': {'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'Unauthorized - missing claims'})
+            }
+
         user_id = event['requestContext']['authorizer']['claims']['sub']
         bucket_name = f"df-{user_id}"
         storage = DataFrameStorage(bucket_name)
         
-        # Parse request
-        body = json.loads(event['body'])
-        df = pd.read_json(body['dataframe'])
+        # Parse and validate request body
+        if not event.get('body'):
+            raise ValueError("Missing request body")
+            
+        try:
+            body = json.loads(event['body'])
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in request body: {e}")
+            raise ValueError("Invalid JSON in request body")
+
+        # Log received data
+        logger.debug(f"Received body: {body}")
+        
+        # Validate required fields
+        if 'dataframe' not in body:
+            raise ValueError("Missing 'dataframe' in request")
+        if 'dataframe_name' not in body:
+            raise ValueError("Missing 'dataframe_name' in request")
+            
+        # Parse DataFrame
+        try:
+            df = pd.read_json(body['dataframe'])
+        except Exception as e:
+            logger.error(f"Error parsing DataFrame: {e}")
+            raise ValueError(f"Invalid DataFrame format: {str(e)}")
+            
         df_name = body['dataframe_name']
         columns_keys = body.get('columns_keys', {})
         external_key = body.get('external_key', 'NOW')
         keep_last = body.get('keep_last', False)
         
+        # Log processing details
+        logger.debug(f"Processing DataFrame with shape: {df.shape}")
+        logger.debug(f"DataFrame name: {df_name}")
+        logger.debug(f"Columns keys: {columns_keys}")
+        
         # Store dataframe
-        metadata = await storage.store_dataframe(
+        metadata = storage.store_dataframe(
             user_id,
             df,
             df_name,
@@ -265,6 +330,13 @@ async def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[st
             'body': json.dumps(metadata)
         }
         
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        return {
+            'statusCode': 400,
+            'headers': {'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': str(e)})
+        }
     except Exception as e:
         logger.exception("Error in upload handler")
         return {
@@ -273,22 +345,29 @@ async def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[st
             'body': json.dumps({'error': str(e)})
         }
 
+
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
-async def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
+def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
     try:
+        logger.debug(f"Event: {json.dumps(event)}")
         user_id = event['requestContext']['authorizer']['claims']['sub']
         bucket_name = f"df-{user_id}"
         storage = DataFrameStorage(bucket_name)
         
-        # Parse request parameters
+        # Parse request parameters and handle path with slashes
         df_name = event['pathParameters']['name']
+        # URL decode the name parameter
+        df_name = unquote(df_name)  # Changed to urllib.parse.unquote
+        
+        logger.debug(f"Getting DataFrame: {df_name}")
+        
         query_params = event.get('queryStringParameters', {}) or {}
         external_key = query_params.get('external_key')
         use_last = query_params.get('use_last', '').lower() == 'true'
         
         # Get dataframe
-        df = await storage.get_dataframe(
+        df = storage.get_dataframe(
             user_id,
             df_name,
             external_key,
@@ -299,21 +378,31 @@ async def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, 
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
             },
             'body': df.to_json(orient='records')
         }
         
     except ValueError as e:
+        logger.warning(f"ValueError: {str(e)}")
         return {
             'statusCode': 404,
-            'headers': {'Access-Control-Allow-Origin': '*'},
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
+            },
             'body': json.dumps({'error': str(e)})
         }
     except Exception as e:
         logger.exception("Error in get handler")
         return {
             'statusCode': 500,
-            'headers': {'Access-Control-Allow-Origin': '*'},
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
+            },
             'body': json.dumps({'error': str(e)})
         }
