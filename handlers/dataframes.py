@@ -12,7 +12,7 @@ from pathlib import Path
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
-from urllib.parse import parse_qs  # Changed this line
+from urllib.parse import unquote
  	
 logger = Logger()
 tracer = Tracer()
@@ -349,34 +349,22 @@ def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
 def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
-    logger.debug("Get handler called")
-    logger.debug(f"Event: {json.dumps(event)}")
     try:
-        # Verify auth claims exist and log them
-        if 'authorizer' not in event.get('requestContext', {}) or \
-           'claims' not in event['requestContext']['authorizer']:
-            logger.error("Missing authorization claims")
-            logger.debug(f"RequestContext: {json.dumps(event.get('requestContext', {}))}")
-            return {
-                'statusCode': 401,
-                'headers': {'Access-Control-Allow-Origin': '*'},
-                'body': json.dumps({'error': 'Unauthorized - missing claims'})
-            }
-
+        logger.debug(f"Event: {json.dumps(event)}")
         user_id = event['requestContext']['authorizer']['claims']['sub']
-        logger.debug(f"User ID: {user_id}")
         bucket_name = f"df-{user_id}"
         storage = DataFrameStorage(bucket_name)
         
-        # Parse request parameters
+        # Parse request parameters and handle path with slashes
         df_name = event['pathParameters']['name']
+        # URL decode the name parameter
+        df_name = unquote(df_name)  # Changed to urllib.parse.unquote
+        
+        logger.debug(f"Getting DataFrame: {df_name}")
+        
         query_params = event.get('queryStringParameters', {}) or {}
         external_key = query_params.get('external_key')
         use_last = query_params.get('use_last', '').lower() == 'true'
-        
-        logger.debug(f"Getting DataFrame: {df_name}")
-        logger.debug(f"External key: {external_key}")
-        logger.debug(f"Use last: {use_last}")
         
         # Get dataframe
         df = storage.get_dataframe(
@@ -390,22 +378,31 @@ def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
             },
             'body': df.to_json(orient='records')
         }
         
     except ValueError as e:
-        logger.warning(f"ValueError in get handler: {str(e)}")
+        logger.warning(f"ValueError: {str(e)}")
         return {
             'statusCode': 404,
-            'headers': {'Access-Control-Allow-Origin': '*'},
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
+            },
             'body': json.dumps({'error': str(e)})
         }
     except Exception as e:
         logger.exception("Error in get handler")
         return {
             'statusCode': 500,
-            'headers': {'Access-Control-Allow-Origin': '*'},
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': 'true'
+            },
             'body': json.dumps({'error': str(e)})
         }
