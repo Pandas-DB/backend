@@ -57,6 +57,88 @@ bucket/
             └── last_key.txt
 ```
 
+## Storage Behavior
+
+### Storage Methods
+
+Each storage pattern (Date, ID, Version Control) supports two storage methods:
+
+1. **Concat** (default)
+   * Preserves existing data
+   * Appends new data alongside existing entries
+   * Creates independent chunks for each upload
+
+Example with Date partitioning:
+```
+# Initial upload (df1 with dates: 2024-01-01, 2024-01-02)
+bucket/
+└── dataframe_name/
+    └── date_column/
+        └── 2024-01-01/
+            └── chunk1.csv.gz
+        └── 2024-01-02/
+            └── chunk2.csv.gz
+
+# After second upload (df2 with dates: 2024-01-01, 2024-01-03)
+bucket/
+└── dataframe_name/
+    └── date_column/
+        └── 2024-01-01/
+            └── chunk1.csv.gz      # From first upload
+            └── chunk3.csv.gz      # From second upload
+        └── 2024-01-02/
+            └── chunk2.csv.gz      # From first upload
+        └── 2024-01-03/
+            └── chunk4.csv.gz      # From second upload
+```
+
+2. **keep_last**
+   * Only replaces data in partitions where new data exists
+   * Preserves data in unaffected partitions
+   * Removes old chunks and creates new ones
+
+Example with Date partitioning:
+```
+# Initial upload (df1 with dates: 2024-01-01, 2024-01-02)
+bucket/
+└── dataframe_name/
+    └── date_column/
+        └── 2024-01-01/
+            └── chunk1.csv.gz
+        └── 2024-01-02/
+            └── chunk2.csv.gz
+
+# After second upload (df2 with dates: 2024-01-01, 2024-01-03)
+bucket/
+└── dataframe_name/
+    └── date_column/
+        └── 2024-01-01/
+            └── chunk3.csv.gz      # New data replaced old chunk
+        └── 2024-01-02/
+            └── chunk2.csv.gz      # Preserved (no new data for this date)
+        └── 2024-01-03/
+            └── chunk4.csv.gz      # New data
+```
+
+### Automatic Logging
+
+Every storage operation creates a backup in a separate logs directory:
+
+```
+bucket/
+└── dataframe_name/
+    └── data/                      # Primary storage
+        └── [storage_pattern]/
+            └── [partitions]/
+                └── chunk_uuid.csv.gz
+    └── logs/                      # Backup storage
+        └── YYYY-MM-DD_HH:MM:SS/   # Timestamp of upload
+            └── chunk_uuid.csv.gz   # Complete backup of uploaded data
+```
+
+Log storage is independent of the primary storage method and always preserves complete upload history.
+
+
 ## API Endpoints
 
 ### Upload DataFrame
