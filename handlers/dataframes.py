@@ -3,7 +3,8 @@ import json
 import boto3
 import uuid
 import gzip
-from io import BytesIO
+from io import BytesIO, StringIO
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Set, Protocol
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,7 +79,8 @@ class S3Storage(StorageBackend):
             paginator = self.s3.get_paginator('list_objects_v2')
             objects = []
             for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-                objects.extend([obj['Key'] for obj in page.get('Contents', [])])
+                if 'Contents' in page:
+                    objects.extend([obj['Key'] for obj in page['Contents']])
             return objects
         except Exception as e:
             raise StorageError(f"Failed to list {prefix}: {str(e)}")
@@ -205,6 +207,15 @@ class DataFrameStorage:
             'ID': IDPartitionStrategy(self.config)
         }
 
+    def _path_exists_in_dynamo(self, user_id: str, df_name: str) -> bool:
+        """Check if the df_name exists in DynamoDB."""
+        try:
+            response = self.table.get_item(Key={'user_id': user_id, 'df_path': df_name})
+            return 'Item' in response
+        except Exception as e:
+            logger.error(f"Error checking DataFrame existence: {str(e)}")
+            return False
+
     def store_dataframe(self, user_id: str, df: pd.DataFrame, df_name: str,
                        columns_keys: Dict[str, str] = None) -> Dict[str, Any]:
         # Convert numeric columns to Python native types
@@ -239,78 +250,125 @@ class DataFrameStorage:
             df_name: str,
             partition_info: Dict[str, Any] = None
     ) -> pd.DataFrame:
-        metadata = self._get_metadata(user_id, df_name)
+        """
+        Retrieves dataframe from S3 using only S3 operations, using parallel processing
+        for better performance.
+        """
+        # Initial check - return empty DataFrame if not in DynamoDB
+        if not self._path_exists_in_dynamo(user_id, df_name):
+            logger.warning(f"DataFrame {df_name} not found for user {user_id}")
+            return pd.DataFrame()
 
-        # If no partition info, return empty dataframe
         if not partition_info or 'partition_type' not in partition_info or 'column' not in partition_info:
             return pd.DataFrame()
 
-        partition_type = partition_info['partition_type']
+        base_path = f"{df_name}/data"
+        partition_type = partition_info['partition_type'].lower()
         column = partition_info['column']
-        partition_key = f"{partition_type}_{column}"
+        prefix = f"{base_path}/{column}"
 
-        if partition_key not in metadata['partitions']:
-            raise StorageError(f"Partition not found: {partition_key}")
+        # Get all keys and filter relevant ones
+        keys = self._list_relevant_keys(prefix, partition_info)
+        if not keys:
+            return pd.DataFrame()
 
-        chunks = metadata['partitions'][partition_key]['chunks']
+        # Use ThreadPoolExecutor to read files in parallel
         dfs = []
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for key in keys:
+                futures.append(
+                    executor.submit(self._read_csv_from_s3, key)
+                )
 
-        # Get filter parameters
-        start_date = partition_info.get('start_date')
-        end_date = partition_info.get('end_date')
-        partition_values = json.loads(partition_info.get('values')) if partition_info.get('values') else None
-
-        # No filters case - return all data
-        if not any([start_date, end_date, partition_values]):
-            for chunk in chunks:
-                with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                    dfs.append(pd.read_csv(gz))
-            return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-        # Filter case
-        for chunk in chunks:
-            df_chunk = None
-
-            if partition_type == 'date':
-                chunk_date = pd.to_datetime(chunk['date'])
-                # Only apply date range filter if both dates are provided
-                if start_date and end_date:
-                    start = pd.to_datetime(start_date)
-                    end = pd.to_datetime(end_date)
-                    if start <= chunk_date <= end:
-                        with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                            df_chunk = pd.read_csv(gz)
-                else:  # No date range filter
-                    with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                        df_chunk = pd.read_csv(gz)
-
-            elif partition_type == 'id':
-                if partition_values:  # Handle multiple ID values
-                    min_id = float(chunk.get('min_id'))
-                    max_id = float(chunk.get('max_id'))
-                    # Check if any requested ID falls within this chunk's range
-                    if any(min_id <= float(v) <= max_id for v in partition_values):
-                        with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                            df_chunk = pd.read_csv(gz)
-                else:  # No ID filter, return all
-                    with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                        df_chunk = pd.read_csv(gz)
-
-            if df_chunk is not None and len(df_chunk) > 0:
-                # Apply additional filtering
-                if partition_type == 'date' and start_date and end_date:
-                    df_chunk[column] = pd.to_datetime(df_chunk[column])
-                    mask = (df_chunk[column] >= start_date) & (df_chunk[column] <= end_date)
-                    df_chunk = df_chunk[mask]
-                elif partition_type == 'id' and partition_values:
-                    # Convert IDs to float for comparison
-                    df_chunk[column] = df_chunk[column].astype(float)
-                    df_chunk = df_chunk[df_chunk[column].isin([float(v) for v in partition_values])]
-
-                if len(df_chunk) > 0:
-                    dfs.append(df_chunk)
+            for future in futures:
+                df = future.result()
+                if df is not None and len(df) > 0:
+                    filtered_df = self._apply_filters(df, partition_info)
+                    if len(filtered_df) > 0:
+                        dfs.append(filtered_df)
 
         return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+    def _list_relevant_keys(self, prefix: str, partition_info: Dict[str, Any]) -> List[str]:
+        """List all relevant S3 keys based on partition type and filters."""
+        all_keys = self.storage.list(prefix)
+        partition_type = partition_info['partition_type'].lower()
+
+        if not partition_info.get('start_date') and not partition_info.get('end_date') and not partition_info.get(
+                'values'):
+            return all_keys
+
+        relevant_keys = []
+        for key in all_keys:
+            if partition_type == 'date':
+                try:
+                    key_date = key.split('/')[-2]  # Assumes date is second-to-last part
+                    is_relevant = True
+
+                    if partition_info.get('start_date'):
+                        is_relevant = is_relevant and key_date >= partition_info['start_date']
+                    if partition_info.get('end_date'):
+                        is_relevant = is_relevant and key_date <= partition_info['end_date']
+
+                    if is_relevant:
+                        relevant_keys.append(key)
+                except:
+                    continue
+
+            elif partition_type == 'id':
+                if partition_info.get('values'):
+                    try:
+                        range_part = key.split('/')[-2]
+                        min_id = float(range_part.split('_')[1])
+                        max_id = float(range_part.split('_')[-1])
+                        values = json.loads(partition_info['values'])
+                        if any(min_id <= float(v) <= max_id for v in values):
+                            relevant_keys.append(key)
+                    except:
+                        continue
+                else:
+                    relevant_keys.append(key)
+
+        return relevant_keys
+
+    def _read_csv_from_s3(self, key: str) -> Optional[pd.DataFrame]:
+        """Read a CSV file from S3."""
+        try:
+            content = self.storage.get(key)
+            with gzip.GzipFile(fileobj=BytesIO(content)) as gz:
+                return pd.read_csv(StringIO(gz.read().decode('utf-8')))
+        except Exception as e:
+            logger.error(f"Error reading key {key}: {str(e)}")
+            return None
+
+    def _apply_filters(self, df: pd.DataFrame, partition_info: Dict[str, Any]) -> pd.DataFrame:
+        """Apply filters to the dataframe based on partition info."""
+        if len(df) == 0:
+            return df
+
+        partition_type = partition_info['partition_type'].lower()
+        column = partition_info['column']
+
+        if partition_type == 'date':
+            df[column] = pd.to_datetime(df[column])
+
+            # Client will send both dates - we need to handle them even if they're the same
+            if partition_info.get('start_date'):
+                mask = (df[column] >= partition_info['start_date'])
+                df = df[mask]
+
+            if partition_info.get('end_date'):
+                mask = (df[column] <= partition_info['end_date'])
+                df = df[mask]
+
+        elif partition_type == 'id':
+            if partition_info.get('values'):
+                df[column] = df[column].astype(float)
+                values = [float(v) for v in json.loads(partition_info['values'])]
+                return df[df[column].isin(values)]
+
+        return df
 
     def _init_metadata(self, df: pd.DataFrame, df_name: str, columns_keys: Dict[str, str]) -> Dict[str, Any]:
         return {
@@ -446,11 +504,19 @@ def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
             partition_info=partition_info
         )
 
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
-            'body': df.to_json(orient='records')
-        }
+        if len(df) > 0:
+            # The client expects just a DataFrame to convert directly
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                'body': df.to_json(orient='records')
+            }
+        else:
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                'body': '[]'
+            }
 
     except Exception as e:
         logger.exception("Error in get")
