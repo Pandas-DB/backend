@@ -158,6 +158,27 @@ functions:
             type: COGNITO_USER_POOLS
             authorizerId: !Ref ApiGatewayAuthorizer
           cors: true
+          
+  getDataframeDates:
+    handler: handlers/dates.list_dates
+    timeout: 30
+    memorySize: 128
+    package:
+      patterns:
+        - "handlers/date.py" 
+    layers:
+      - {Ref: DependenciesLambdaLayer}
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-dates
+    events:
+      - http:
+          path: dataframesDates/{name}
+          method: get
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+            identitySource: method.request.header.Authorization
+          cors: true
 
 resources:
   Resources:
