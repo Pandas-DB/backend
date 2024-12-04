@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from abc import ABC, abstractmethod
 import pandas as pd
+import numpy as np
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
@@ -205,7 +206,11 @@ class DataFrameStorage:
         }
 
     def store_dataframe(self, user_id: str, df: pd.DataFrame, df_name: str,
-                        columns_keys: Dict[str, str] = None) -> Dict[str, Any]:
+                       columns_keys: Dict[str, str] = None) -> Dict[str, Any]:
+        # Convert numeric columns to Python native types
+        for col in df.select_dtypes(include=['integer', 'floating']).columns:
+            df[col] = df[col].map(convert_numpy_types)
+
         metadata = self._init_metadata(df, df_name, columns_keys)
 
         # Store by partition type
@@ -222,16 +227,88 @@ class DataFrameStorage:
                 'chunks': chunks
             }
 
+        metadata = json.loads(
+            json.dumps(metadata, default=convert_numpy_types)
+        )
         self._store_metadata(user_id, df_name, metadata)
         return metadata
 
-    def get_dataframe(self, user_id: str, df_name: str, partition_info: Dict[str, Any] = None) -> pd.DataFrame:
-        chunks = self._get_chunks(user_id, df_name, partition_info)
+    def get_dataframe(
+            self,
+            user_id: str,
+            df_name: str,
+            partition_info: Dict[str, Any] = None
+    ) -> pd.DataFrame:
+        metadata = self._get_metadata(user_id, df_name)
+
+        # If no partition info, return empty dataframe
+        if not partition_info or 'partition_type' not in partition_info or 'column' not in partition_info:
+            return pd.DataFrame()
+
+        partition_type = partition_info['partition_type']
+        column = partition_info['column']
+
+        # The partition key should match how it was stored
+        partition_key = f"{partition_type}_{column}"
+
+        if partition_key not in metadata['partitions']:
+            raise StorageError(f"Partition not found: {partition_key}")
+
+        chunks = metadata['partitions'][partition_key]['chunks']
         dfs = []
 
+        # Get filter parameters if they exist
+        start_date = partition_info.get('start_date')
+        end_date = partition_info.get('end_date')
+        partition_value = partition_info.get('partition_value')
+
+        # No filters case - return all data
+        if not any([start_date, end_date, partition_value]):
+            for chunk in chunks:
+                with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
+                    dfs.append(pd.read_csv(gz))
+            return pd.concat(dfs, ignore_index=True)
+
+        # Filter case
         for chunk in chunks:
-            with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
-                dfs.append(pd.read_csv(gz))
+            df_chunk = None
+
+            if partition_type == 'date':
+                chunk_date = pd.to_datetime(chunk['date'])
+                # Only apply date range filter if both dates are provided
+                if start_date and end_date:
+                    start = pd.to_datetime(start_date)
+                    end = pd.to_datetime(end_date)
+                    if start <= chunk_date <= end:
+                        with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
+                            df_chunk = pd.read_csv(gz)
+                else:  # No date range filter
+                    with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
+                        df_chunk = pd.read_csv(gz)
+
+            elif partition_type == 'id':
+                if partition_value:  # Only filter if ID value provided
+                    min_id = chunk.get('min_id')
+                    max_id = chunk.get('max_id')
+                    if min_id <= float(partition_value) <= max_id:
+                        with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
+                            df_chunk = pd.read_csv(gz)
+                else:  # No ID filter
+                    with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
+                        df_chunk = pd.read_csv(gz)
+
+            if df_chunk is not None:
+                # Additional within-chunk filtering only if date range provided
+                if partition_type == 'date' and start_date and end_date:
+                    df_chunk[column] = pd.to_datetime(df_chunk[column])
+                    mask = (df_chunk[column] >= start_date) & (df_chunk[column] <= end_date)
+                    df_chunk = df_chunk[mask]
+
+                if len(df_chunk) > 0:
+                    dfs.append(df_chunk)
+
+        if not dfs:
+            return pd.DataFrame()
 
         return pd.concat(dfs, ignore_index=True)
 
@@ -277,6 +354,21 @@ def validate_request(event: APIGatewayProxyEvent) -> str:
     return event['requestContext']['authorizer']['claims']['sub']
 
 
+def convert_numpy_types(obj):
+    """Convert numpy types to native Python types"""
+    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8,
+                        np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
 def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
@@ -291,12 +383,23 @@ def upload(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any
         if 'dataframe' not in body or 'dataframe_name' not in body:
             raise ValidationError("Missing required fields")
 
+        # Parse the JSON data back to DataFrame
         df = pd.read_json(body['dataframe'])
+
+        # Convert numeric columns to Python native types
+        for col in df.select_dtypes(include=['integer', 'floating']).columns:
+            df[col] = df[col].map(convert_numpy_types)
+
         metadata = storage.store_dataframe(
             user_id=user_id,
             df=df,
             df_name=body['dataframe_name'],
             columns_keys=body.get('columns_keys')
+        )
+
+        # Convert numpy types in metadata before JSON serialization
+        metadata = json.loads(
+            json.dumps(metadata, default=convert_numpy_types)
         )
 
         return {
@@ -324,13 +427,23 @@ def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
         df_name = unquote(event['pathParameters']['name'])
         params = event.get('queryStringParameters', {}) or {}
 
+        # Construct partition info from query parameters
+        partition_info = {}
+        if params.get('partition_type'):
+            partition_info = {
+                'partition_type': params.get('partition_type'),
+                'column': params.get('column'),
+                'start_date': params.get('start_date'),
+                'end_date': params.get('end_date'),
+                'partition_value': params.get('partition_value')
+            }
+            # Remove None values
+            partition_info = {k: v for k, v in partition_info.items() if v is not None}
+
         df = storage.get_dataframe(
             user_id=user_id,
             df_name=df_name,
-            partition_info={
-                'type': params.get('partition_type'),
-                'column': params.get('column')
-            } if params.get('partition_type') else None
+            partition_info=partition_info
         )
 
         return {
