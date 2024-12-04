@@ -247,8 +247,6 @@ class DataFrameStorage:
 
         partition_type = partition_info['partition_type']
         column = partition_info['column']
-
-        # The partition key should match how it was stored
         partition_key = f"{partition_type}_{column}"
 
         if partition_key not in metadata['partitions']:
@@ -257,17 +255,17 @@ class DataFrameStorage:
         chunks = metadata['partitions'][partition_key]['chunks']
         dfs = []
 
-        # Get filter parameters if they exist
+        # Get filter parameters
         start_date = partition_info.get('start_date')
         end_date = partition_info.get('end_date')
-        partition_value = partition_info.get('partition_value')
+        partition_values = json.loads(partition_info.get('values')) if partition_info.get('values') else None
 
         # No filters case - return all data
-        if not any([start_date, end_date, partition_value]):
+        if not any([start_date, end_date, partition_values]):
             for chunk in chunks:
                 with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
                     dfs.append(pd.read_csv(gz))
-            return pd.concat(dfs, ignore_index=True)
+            return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
         # Filter case
         for chunk in chunks:
@@ -287,30 +285,32 @@ class DataFrameStorage:
                         df_chunk = pd.read_csv(gz)
 
             elif partition_type == 'id':
-                if partition_value:  # Only filter if ID value provided
-                    min_id = chunk.get('min_id')
-                    max_id = chunk.get('max_id')
-                    if min_id <= float(partition_value) <= max_id:
+                if partition_values:  # Handle multiple ID values
+                    min_id = float(chunk.get('min_id'))
+                    max_id = float(chunk.get('max_id'))
+                    # Check if any requested ID falls within this chunk's range
+                    if any(min_id <= float(v) <= max_id for v in partition_values):
                         with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
                             df_chunk = pd.read_csv(gz)
-                else:  # No ID filter
+                else:  # No ID filter, return all
                     with gzip.GzipFile(fileobj=BytesIO(self.storage.get(chunk['path']))) as gz:
                         df_chunk = pd.read_csv(gz)
 
-            if df_chunk is not None:
-                # Additional within-chunk filtering only if date range provided
+            if df_chunk is not None and len(df_chunk) > 0:
+                # Apply additional filtering
                 if partition_type == 'date' and start_date and end_date:
                     df_chunk[column] = pd.to_datetime(df_chunk[column])
                     mask = (df_chunk[column] >= start_date) & (df_chunk[column] <= end_date)
                     df_chunk = df_chunk[mask]
+                elif partition_type == 'id' and partition_values:
+                    # Convert IDs to float for comparison
+                    df_chunk[column] = df_chunk[column].astype(float)
+                    df_chunk = df_chunk[df_chunk[column].isin([float(v) for v in partition_values])]
 
                 if len(df_chunk) > 0:
                     dfs.append(df_chunk)
 
-        if not dfs:
-            return pd.DataFrame()
-
-        return pd.concat(dfs, ignore_index=True)
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def _init_metadata(self, df: pd.DataFrame, df_name: str, columns_keys: Dict[str, str]) -> Dict[str, Any]:
         return {
