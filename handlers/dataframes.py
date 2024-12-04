@@ -5,41 +5,29 @@ import uuid
 import gzip
 from io import BytesIO, StringIO
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional, Set, Protocol
+from typing import Dict, Any, List, Optional, Protocol
 from dataclasses import dataclass
 from datetime import datetime
 from abc import ABC, abstractmethod
 import pandas as pd
-import numpy as np
+
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
 from urllib.parse import unquote
+
+from .utils.exceptions import ValidationError
+from .utils.config import StorageConfig
+from .utils.storage import S3Storage
+from .utils.validators import validate_request
+from .utils.converters import convert_numpy_types
 
 logger = Logger()
 tracer = Tracer()
 
 
 # Exceptions
-class StorageError(Exception): pass
-
-
-class ValidationError(Exception): pass
-
-
 class PartitionError(Exception): pass
-
-
-# Config
-@dataclass
-class StorageConfig:
-    chunk_size: int = 1000000
-    reserved_words: Set[str] = None
-    default_storage_method: str = 'concat'
-
-    def __post_init__(self):
-        if self.reserved_words is None:
-            self.reserved_words = {'log', 'default'}
 
 
 # Storage Interface
@@ -51,39 +39,6 @@ class StorageBackend(Protocol):
     def delete(self, path: str) -> None: pass
 
     def list(self, prefix: str) -> List[str]: pass
-
-
-class S3Storage(StorageBackend):
-    def __init__(self, bucket: str):
-        self.s3 = boto3.client('s3')
-        self.bucket = bucket
-
-    def store(self, path: str, content: bytes) -> str:
-        self.s3.put_object(Bucket=self.bucket, Key=path, Body=content)
-        return path
-
-    def get(self, path: str) -> bytes:
-        try:
-            return self.s3.get_object(Bucket=self.bucket, Key=path)['Body'].read()
-        except Exception as e:
-            raise StorageError(f"Failed to get {path}: {str(e)}")
-
-    def delete(self, path: str) -> None:
-        try:
-            self.s3.delete_object(Bucket=self.bucket, Key=path)
-        except Exception as e:
-            raise StorageError(f"Failed to delete {path}: {str(e)}")
-
-    def list(self, prefix: str) -> List[str]:
-        try:
-            paginator = self.s3.get_paginator('list_objects_v2')
-            objects = []
-            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-                if 'Contents' in page:
-                    objects.extend([obj['Key'] for obj in page['Contents']])
-            return objects
-        except Exception as e:
-            raise StorageError(f"Failed to list {prefix}: {str(e)}")
 
 
 # Partition Strategies
@@ -391,29 +346,6 @@ class DataFrameStorage:
             'metadata': metadata,
             'created_at': datetime.utcnow().isoformat()
         })
-
-
-# Lambda Handlers
-def validate_request(event: APIGatewayProxyEvent) -> str:
-    if 'authorizer' not in event.get('requestContext', {}) or \
-            'claims' not in event['requestContext']['authorizer']:
-        raise ValidationError("Unauthorized")
-    return event['requestContext']['authorizer']['claims']['sub']
-
-
-def convert_numpy_types(obj):
-    """Convert numpy types to native Python types"""
-    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
-                        np.int16, np.int32, np.int64, np.uint8,
-                        np.uint16, np.uint32, np.uint64)):
-        return int(obj)
-    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return obj
 
 
 @logger.inject_lambda_context
