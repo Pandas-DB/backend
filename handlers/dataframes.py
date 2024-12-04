@@ -102,6 +102,7 @@ class DatePartitionStrategy(PartitionStrategy):
             raise ValidationError(f"Column '{column}' not found")
 
         try:
+            # Ensure dates are parsed correctly - the incoming data should already be in YYYY-MM-DD format
             df[column] = pd.to_datetime(df[column])
         except Exception as e:
             raise ValidationError(f"Invalid date format in column '{column}': {str(e)}")
@@ -111,8 +112,9 @@ class DatePartitionStrategy(PartitionStrategy):
             if len(date_df) == 0:
                 continue
 
-            date_str = date.strftime('%Y-%m-%d')
-            path = f"{base_path}/data/{column}/{date_str}"
+            # Use the actual date from the data, not the grouper date
+            actual_date = date_df[column].iloc[0].strftime('%Y-%m-%d')
+            path = f"{base_path}/data/{column}/{actual_date}"
 
             for i in range(0, len(date_df), self.config.chunk_size):
                 chunk_df = date_df.iloc[i:i + self.config.chunk_size]
@@ -127,7 +129,7 @@ class DatePartitionStrategy(PartitionStrategy):
                 chunks_info.append({
                     'path': chunk_path,
                     'rows': len(chunk_df),
-                    'date': date_str
+                    'date': actual_date  # Use actual date here too
                 })
 
         return chunks_info
@@ -337,7 +339,8 @@ class DataFrameStorage:
         try:
             content = self.storage.get(key)
             with gzip.GzipFile(fileobj=BytesIO(content)) as gz:
-                return pd.read_csv(StringIO(gz.read().decode('utf-8')))
+                df = pd.read_csv(StringIO(gz.read().decode('utf-8')))
+                return df
         except Exception as e:
             logger.error(f"Error reading key {key}: {str(e)}")
             return None
@@ -351,9 +354,9 @@ class DataFrameStorage:
         column = partition_info['column']
 
         if partition_type == 'date':
+            # Convert from stored format to datetime
             df[column] = pd.to_datetime(df[column])
 
-            # Client will send both dates - we need to handle them even if they're the same
             if partition_info.get('start_date'):
                 mask = (df[column] >= partition_info['start_date'])
                 df = df[mask]
@@ -361,6 +364,9 @@ class DataFrameStorage:
             if partition_info.get('end_date'):
                 mask = (df[column] <= partition_info['end_date'])
                 df = df[mask]
+
+            # Convert datetime to string format before returning
+            df[column] = df[column].dt.strftime('%Y-%m-%d')
 
         elif partition_type == 'id':
             if partition_info.get('values'):
@@ -385,23 +391,6 @@ class DataFrameStorage:
             'metadata': metadata,
             'created_at': datetime.utcnow().isoformat()
         })
-
-    def _get_chunks(self, user_id: str, df_name: str, partition_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        metadata = self._get_metadata(user_id, df_name)
-        if not partition_info:
-            return []
-
-        partition_key = f"{partition_info['type']}_{partition_info['column']}"
-        if partition_key not in metadata['partitions']:
-            raise StorageError(f"Partition not found: {partition_key}")
-
-        return metadata['partitions'][partition_key]['chunks']
-
-    def _get_metadata(self, user_id: str, df_name: str) -> Dict[str, Any]:
-        response = self.table.get_item(Key={'user_id': user_id, 'df_path': df_name})
-        if 'Item' not in response:
-            raise StorageError(f"DataFrame not found: {df_name}")
-        return response['Item']['metadata']
 
 
 # Lambda Handlers
