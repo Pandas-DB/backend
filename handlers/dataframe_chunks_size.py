@@ -89,16 +89,21 @@ class DataFrameChunksSize:
         ranges = []
         start_idx = 0
 
-        for idx, key in enumerate(keys):
-            try:
-                size = self.storage.head(key)
+        # Key change: Use head_batch_multithread to get all sizes at once
+        try:
+            sizes = self.storage.head_batch_multithread(keys)
+
+            for idx, key in enumerate(keys):
+                size = sizes.get(key, 0)  # Use 0 as default if size not found
                 current_size += size
                 if current_size >= max_size_mb * 1024 * 1024:
                     ranges.append((start_idx, idx - 1))
                     start_idx = idx
                     current_size = size
-            except Exception as e:
-                logger.error(f"Error getting size for {key}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error getting sizes in batch: {e}")
+            return []
 
         if start_idx < len(keys):
             ranges.append((start_idx, len(keys) - 1))

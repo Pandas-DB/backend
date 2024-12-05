@@ -57,17 +57,18 @@ class DatePartitionStrategy(PartitionStrategy):
             raise ValidationError(f"Column '{column}' not found")
 
         try:
-            # Ensure dates are parsed correctly - the incoming data should already be in YYYY-MM-DD format
             df[column] = pd.to_datetime(df[column])
         except Exception as e:
             raise ValidationError(f"Invalid date format in column '{column}': {str(e)}")
 
         chunks_info = []
+        store_operations: Dict[str, bytes] = {}
+
+        # Prepare all chunks first
         for date, date_df in df.groupby(pd.Grouper(key=column, freq='D')):
             if len(date_df) == 0:
                 continue
 
-            # Use the actual date from the data, not the grouper date
             actual_date = date_df[column].iloc[0].strftime('%Y-%m-%d')
             path = f"{base_path}/data/{column}/{actual_date}"
 
@@ -80,13 +81,15 @@ class DatePartitionStrategy(PartitionStrategy):
                 with gzip.GzipFile(fileobj=buffer, mode='w') as gz:
                     chunk_df.to_csv(gz, index=False)
 
-                storage.store(chunk_path, buffer.getvalue())
+                store_operations[chunk_path] = buffer.getvalue()
                 chunks_info.append({
                     'path': chunk_path,
                     'rows': len(chunk_df),
-                    'date': actual_date  # Use actual date here too
+                    'date': actual_date
                 })
 
+        # Store all chunks in parallel
+        storage.store_batch_multithread(store_operations)
         return chunks_info
 
 
@@ -103,6 +106,7 @@ class IDPartitionStrategy(PartitionStrategy):
 
         df = df.sort_values(column)
         chunks_info = []
+        store_operations: Dict[str, bytes] = {}
 
         for i in range(0, len(df), self.config.chunk_size):
             chunk_df = df.iloc[i:i + self.config.chunk_size]
@@ -117,7 +121,7 @@ class IDPartitionStrategy(PartitionStrategy):
             with gzip.GzipFile(fileobj=buffer, mode='w') as gz:
                 chunk_df.to_csv(gz, index=False)
 
-            storage.store(chunk_path, buffer.getvalue())
+            store_operations[chunk_path] = buffer.getvalue()
             chunks_info.append({
                 'path': chunk_path,
                 'rows': len(chunk_df),
@@ -125,6 +129,8 @@ class IDPartitionStrategy(PartitionStrategy):
                 'max_id': max_id
             })
 
+        # Store all chunks in parallel
+        storage.store_batch_multithread(store_operations)
         return chunks_info
 
 
@@ -279,37 +285,45 @@ class DataFrameStorage:
             return all_keys
 
         relevant_keys = []
-        for key in all_keys:
-            if partition_type == 'date':
-                try:
-                    key_date = key.split('/')[-2]  # Assumes date is second-to-last part
-                    is_relevant = True
 
-                    if partition_info.get('start_date'):
-                        is_relevant = is_relevant and key_date >= partition_info['start_date']
-                    if partition_info.get('end_date'):
-                        is_relevant = is_relevant and key_date <= partition_info['end_date']
+        # Process filtering based on partition type
+        if partition_type == 'date':
+            key_dates = [(key, key.split('/')[-2]) for key in all_keys]
+            start_date = partition_info.get('start_date')
+            end_date = partition_info.get('end_date')
 
-                    if is_relevant:
-                        relevant_keys.append(key)
-                except:
-                    continue
+            for key, key_date in key_dates:
+                if ((not start_date or key_date >= start_date) and
+                        (not end_date or key_date <= end_date)):
+                    relevant_keys.append(key)
 
-            elif partition_type == 'id':
-                if partition_info.get('values'):
+        elif partition_type == 'id' and partition_info.get('values'):
+            try:
+                values = [float(v) for v in json.loads(partition_info['values'])]
+                key_ranges = []
+
+                # Extract ranges in batch
+                for key in all_keys:
                     try:
                         range_part = key.split('/')[-2]
                         min_id = float(range_part.split('_')[1])
                         max_id = float(range_part.split('_')[-1])
-                        values = json.loads(partition_info['values'])
-                        if any(min_id <= float(v) <= max_id for v in values):
-                            relevant_keys.append(key)
+                        key_ranges.append((key, min_id, max_id))
                     except:
                         continue
-                else:
-                    relevant_keys.append(key)
 
-        return relevant_keys
+                # Filter based on ranges
+                relevant_keys = [
+                    key for key, min_id, max_id in key_ranges
+                    if any(min_id <= v <= max_id for v in values)
+                ]
+            except Exception as e:
+                logger.error(f"Error processing ID values: {str(e)}")
+                return []
+        else:
+            relevant_keys = all_keys
+
+        return sorted(relevant_keys)
 
     def _read_csv_from_s3(self, key: str) -> Optional[pd.DataFrame]:
         """Read a CSV file from S3."""

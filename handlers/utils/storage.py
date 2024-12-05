@@ -1,4 +1,4 @@
-from typing import Protocol, List, Dict
+from typing import Protocol, List, Dict, Tuple
 import boto3
 from .exceptions import StorageError
 from concurrent.futures import ThreadPoolExecutor
@@ -66,7 +66,7 @@ class S3Storage(StorageBackend):
             StorageError: If any retrieval fails
         """
         results: Dict[str, bytes] = {}
-        failed_keys: List[tuple[str, Exception]] = []
+        failed_keys: List[Tuple[str, Exception]] = []
 
         def _get_single_object(key: str) -> None:
             try:
@@ -84,3 +84,99 @@ class S3Storage(StorageBackend):
             raise StorageError(f"Failed to retrieve some objects:\n{error_messages}")
 
         return results
+
+    def delete_batch_multithread(self, keys: List[str], max_workers: int = 100) -> None:
+        """
+        Delete multiple S3 objects in parallel.
+
+        Args:
+            keys: List of S3 keys to delete
+            max_workers: Maximum number of concurrent threads for deletion
+
+        Raises:
+            StorageError: If any deletion fails
+        """
+        failed_keys: List[Tuple[str, Exception]] = []
+
+        def _delete_single_object(key: str) -> None:
+            try:
+                self.delete(key)
+            except Exception as e:
+                failed_keys.append((key, e))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(_delete_single_object, keys)
+
+        if failed_keys:
+            error_messages = '\n'.join(f"- {key}: {str(error)}" for key, error in failed_keys)
+            raise StorageError(f"Failed to delete some objects:\n{error_messages}")
+
+    def head_batch_multithread(self, keys: List[str], max_workers: int = 100) -> Dict[str, int]:
+        """
+        Get content lengths for multiple S3 objects in parallel.
+
+        Args:
+            keys: List of S3 keys to get sizes for
+            max_workers: Maximum number of concurrent threads
+
+        Returns:
+            Dictionary mapping keys to their content lengths
+
+        Raises:
+            StorageError: If any head request fails
+        """
+        results: Dict[str, int] = {}
+        failed_keys: List[Tuple[str, Exception]] = []
+
+        def _head_single_object(key: str) -> None:
+            try:
+                size = self.head(key)
+                results[key] = size
+            except Exception as e:
+                failed_keys.append((key, e))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(_head_single_object, keys)
+
+        if failed_keys:
+            error_messages = '\n'.join(f"- {key}: {str(error)}" for key, error in failed_keys)
+            raise StorageError(f"Failed to get sizes for some objects:\n{error_messages}")
+
+        return results
+
+    def store_batch_multithread(
+        self,
+        items: Dict[str, bytes],
+        max_workers: int = 100
+    ) -> List[str]:
+        """
+        Store multiple objects in S3 in parallel.
+
+        Args:
+            items: Dictionary mapping keys to their contents as bytes
+            max_workers: Maximum number of concurrent threads
+
+        Returns:
+            List of successfully stored keys
+
+        Raises:
+            StorageError: If any store operation fails
+        """
+        failed_keys: List[Tuple[str, Exception]] = []
+        successful_keys: List[str] = []
+
+        def _store_single_object(key: str) -> None:
+            try:
+                self.store(key, items[key])
+                successful_keys.append(key)
+            except Exception as e:
+                failed_keys.append((key, e))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(_store_single_object, items.keys())
+
+        if failed_keys:
+            error_messages = '\n'.join(f"- {key}: {str(error)}" for key, error in failed_keys)
+            raise StorageError(f"Failed to store some objects:\n{error_messages}")
+
+        return successful_keys
