@@ -26,37 +26,60 @@ class DataFrameChunksSize:
             return []
 
         partition_type = partition_info['partition_type'].lower()
-        if partition_type != 'date':
-            return []
-
         if 'column' in partition_info:
             prefix = f"{prefix}/data/{partition_info['column']}"
             all_keys = self.storage.list(prefix)
 
         relevant_keys = []
-        for key in all_keys:
+
+        if partition_type == 'date':
+            for key in all_keys:
+                try:
+                    path_parts = key.split('/')
+                    if len(path_parts) >= 2:
+                        key_date = path_parts[-2]
+
+                        if not partition_info.get('start_date') and not partition_info.get('end_date'):
+                            relevant_keys.append(key)
+                            continue
+
+                        is_relevant = True
+                        if partition_info.get('start_date'):
+                            is_relevant = is_relevant and key_date >= partition_info['start_date']
+                        if partition_info.get('end_date'):
+                            is_relevant = is_relevant and key_date <= partition_info['end_date']
+
+                        if is_relevant:
+                            relevant_keys.append(key)
+                except Exception as e:
+                    logger.warning(f"Error processing date key {key}: {str(e)}")
+                    continue
+
+        elif partition_type == 'id':
+            if not partition_info.get('values'):
+                return sorted(all_keys)
+
             try:
-                path_parts = key.split('/')
-                if len(path_parts) >= 2:
-                    key_date = path_parts[-2]
+                values = json.loads(partition_info['values'])
+                values = [float(v) for v in values]
 
-                    if not partition_info.get('start_date') and not partition_info.get('end_date'):
-                        relevant_keys.append(key)
+                for key in all_keys:
+                    try:
+                        range_part = key.split('/')[-2]  # Gets "from_X_to_Y" part
+                        min_id = float(range_part.split('_')[1])  # Gets X from "from_X_to_Y"
+                        max_id = float(range_part.split('_')[-1])  # Gets Y from "from_X_to_Y"
+
+                        # Check if any requested ID falls within this chunk's range
+                        if any(min_id <= v <= max_id for v in values):
+                            relevant_keys.append(key)
+                    except Exception as e:
+                        logger.warning(f"Error processing ID key {key}: {str(e)}")
                         continue
-
-                    is_relevant = True
-                    if partition_info.get('start_date'):
-                        is_relevant = is_relevant and key_date >= partition_info['start_date']
-                    if partition_info.get('end_date'):
-                        is_relevant = is_relevant and key_date <= partition_info['end_date']
-
-                    if is_relevant:
-                        relevant_keys.append(key)
             except Exception as e:
-                logger.warning(f"Error processing key {key}: {str(e)}")
-                continue
+                logger.error(f"Error processing ID values: {str(e)}")
+                return []
 
-        return relevant_keys
+        return sorted(relevant_keys)
 
     def get_index_ranges(self, prefix: str, partition_info: Dict[str, Any], max_size_mb: int = 5) -> List[
         Tuple[int, int]]:

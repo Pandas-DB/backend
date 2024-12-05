@@ -5,7 +5,7 @@ import uuid
 import gzip
 from io import BytesIO, StringIO
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional, Protocol
+from typing import Dict, Any, List, Optional, Protocol, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 from abc import ABC, abstractmethod
@@ -205,13 +205,14 @@ class DataFrameStorage:
             self,
             user_id: str,
             df_name: str,
-            partition_info: Dict[str, Any] = None
+            partition_info: Dict[str, Any] = None,
+            chunk_range: Optional[Tuple[int, int]] = None,
     ) -> pd.DataFrame:
         """
         Retrieves dataframe from S3 using only S3 operations, using parallel processing
         for better performance.
         """
-        # Initial check - return empty DataFrame if not in DynamoDB
+        # Initial validation
         if not self._path_exists_in_dynamo(user_id, df_name):
             logger.warning(f"DataFrame {df_name} not found for user {user_id}")
             return pd.DataFrame()
@@ -219,33 +220,54 @@ class DataFrameStorage:
         if not partition_info or 'partition_type' not in partition_info or 'column' not in partition_info:
             return pd.DataFrame()
 
+        # Construct the base path and get relevant keys
         base_path = f"{df_name}/data"
-        partition_type = partition_info['partition_type'].lower()
         column = partition_info['column']
         prefix = f"{base_path}/{column}"
 
-        # Get all keys and filter relevant ones
         keys = self._list_relevant_keys(prefix, partition_info)
         if not keys:
             return pd.DataFrame()
 
-        # Use ThreadPoolExecutor to read files in parallel
-        dfs = []
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for key in keys:
-                futures.append(
-                    executor.submit(self._read_csv_from_s3, key)
-                )
+        if chunk_range is not None:
+            print(f'Length of chunk range: {(chunk_range[1] - chunk_range[0])} | '
+                  f'Length of keys: {len(keys)}')
+            start_chunk = chunk_range[0]
+            end_chunk = chunk_range[1]
+            try:
+                keys = sorted(keys)[start_chunk: end_chunk + 1]
+            except Exception as e:
+                raise ValidationError(f"Invalid key ranges. Keys len: {len(keys)} | "
+                                      f"Start chunk index: {start_chunk} | "
+                                      f"End chunk index: {end_chunk} | error {e}")
 
-            for future in futures:
-                df = future.result()
-                if df is not None and len(df) > 0:
-                    filtered_df = self._apply_filters(df, partition_info)
-                    if len(filtered_df) > 0:
-                        dfs.append(filtered_df)
+        try:
+            # Use get_batch to retrieve all files at once
+            contents = self.storage.get_batch_multithread(keys)
+        except Exception as e:
+            raise ValidationError(f"Failed to get dataframe binaries | Error {e}")
 
-        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        try:
+            # Process all files
+            dfs = []
+            for key, content in contents.items():
+                try:
+                    # First decompress the gzip content
+                    with gzip.GzipFile(fileobj=BytesIO(content), mode='rb') as gz:
+                        decompressed_content = gz.read().decode('utf-8')
+                        df = pd.read_csv(StringIO(decompressed_content))
+                        if df is not None and not df.empty:
+                            filtered_df = self._apply_filters(df, partition_info)
+                            if not filtered_df.empty:
+                                dfs.append(filtered_df)
+                except Exception as e:
+                    logger.error(f"Error processing file {key}: {str(e)}")
+                    continue
+
+            return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+        except Exception as e:
+            raise ValidationError(f"Failed to get dataframe from keys | Error {e}")
 
     def _list_relevant_keys(self, prefix: str, partition_info: Dict[str, Any]) -> List[str]:
         """List all relevant S3 keys based on partition type and filters."""
@@ -419,10 +441,21 @@ def get(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
             # Remove None values
             partition_info = {k: v for k, v in partition_info.items() if v is not None}
 
+        chunk_range = None
+        if params.get('chunk_range'):
+            try:
+                chunk_range = json.loads(params.get('chunk_range'))
+                if not isinstance(chunk_range, list) or len(chunk_range) != 2:
+                    raise ValidationError("chunk_range must be a list of two integers")
+                chunk_range = (int(chunk_range[0]), int(chunk_range[1]))  # Convert to tuple
+            except json.JSONDecodeError:
+                raise ValidationError("Invalid chunk_range format")
+
         df = storage.get_dataframe(
             user_id=user_id,
             df_name=df_name,
-            partition_info=partition_info
+            partition_info=partition_info,
+            chunk_range=chunk_range,
         )
 
         if len(df) > 0:

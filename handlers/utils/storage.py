@@ -1,6 +1,7 @@
-from typing import Protocol, List
+from typing import Protocol, List, Dict
 import boto3
 from .exceptions import StorageError
+from concurrent.futures import ThreadPoolExecutor
 
 
 class StorageBackend(Protocol):
@@ -49,3 +50,37 @@ class S3Storage(StorageBackend):
             return size
         except Exception as e:
             raise StorageError(f"Failed to get size for {path}: {str(e)}")
+
+    def get_batch_multithread(self, keys: List[str], max_workers: int = 100) -> Dict[str, bytes]:
+        """
+        Recursively retrieve multiple S3 objects in parallel.
+
+        Args:
+            keys: List of S3 keys to retrieve
+            max_workers: Maximum number of concurrent threads for retrieval
+
+        Returns:
+            Dictionary mapping keys to their contents as bytes
+
+        Raises:
+            StorageError: If any retrieval fails
+        """
+        results: Dict[str, bytes] = {}
+        failed_keys: List[tuple[str, Exception]] = []
+
+        def _get_single_object(key: str) -> None:
+            try:
+                content = self.get(key)
+                results[key] = content
+            except Exception as e:
+                failed_keys.append((key, e))
+
+        # Use ThreadPoolExecutor for parallel retrieval
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(_get_single_object, keys)
+
+        if failed_keys:
+            error_messages = '\n'.join(f"- {key}: {str(error)}" for key, error in failed_keys)
+            raise StorageError(f"Failed to retrieve some objects:\n{error_messages}")
+
+        return results
