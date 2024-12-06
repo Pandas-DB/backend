@@ -58,8 +58,11 @@ def schedule_cleanup(bucket: str, key: str, s3_client) -> None:
 def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
     """Main Lambda handler for S3 Select streaming operations"""
     user_id = validate_request(event)
+    logger.info(f"Validated user_id: {user_id}")
+
     s3 = boto3.client('s3')
     bucket = f"df-{user_id}"
+    logger.info(f"Using bucket: {bucket}")
 
     # Initialize variables for cleanup in case of failure
     multipart_upload = None
@@ -68,6 +71,19 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
     try:
         # Get the key from path parameters instead of body
         path_params = event.get('pathParameters', {})
+        logger.info(f"Path parameters: {path_params}")
+
+        if path_params is None:
+            logger.error("Path parameters is None")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Missing path parameters'}),
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            }
+
         key = unquote(path_params.get('dataframe_id', ''))
 
         if not key:
@@ -76,10 +92,13 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
         # Append data.csv if not already present
         if not key.endswith('.csv'):
             key = f"{key.rstrip('/')}/data.csv"
+        logger.info(f"Final key: {key}")
 
         # Extract and validate parameters
-        query_params = event.get('queryStringParameters', {})
-        query = query_params.get('query', 'SELECT * FROM s3object')
+        query_params = event.get('queryStringParameters') or {}
+        query = query_params.get('query') if query_params else 'SELECT * FROM s3object'
+        if not query:  # Handle empty string case
+            query = 'SELECT * FROM s3object'
 
         logger.info(f"Processing query: {query} on {bucket}/{key}")
 
