@@ -38,6 +38,11 @@ provider:
             - s3:ListObjects
             - s3:ListObjectsV2
             - s3:HeadBucket
+            - s3:CreateMultipartUpload,
+            - s3:CompleteMultipartUpload,
+            - s3:AbortMultipartUpload,
+            - s3:ListMultipartUploadParts,
+            - s3:UploadPart,
           Resource:
             - "arn:aws:s3:::df-*"
             - "arn:aws:s3:::df-*/*"
@@ -71,38 +76,43 @@ layers:
       - python3.9
 
 functions:
-  uploadDataFrame:
-    handler: handlers/dataframes.upload
+
+  postDataFrame:
+    handler: handlers/post_dataframe.post_dataframe
     timeout: 900
     memorySize: 3008
     package:
       patterns:
-        - "handlers/dataframes.py"
+        - "handlers/post_dataframe.py"
     layers:
       - {Ref: DependenciesLambdaLayer}
     events:
       - http:
-          path: dataframes/upload
+          path: dataframes/{dataframe_id}/upload
           method: post
           authorizer:
             type: COGNITO_USER_POOLS
             authorizerId: !Ref ApiGatewayAuthorizer
           cors: true
+          request:
+            parameters:
+              paths:
+                dataframe_id: true
     environment:
       POWERTOOLS_METRICS_NAMESPACE: ${self:service}-upload
 
   getDataFrame:
-    handler: handlers/dataframes.get
+    handler: handlers/get_dataframe.get_dataframe
     timeout: 900
     memorySize: 3008
     package:
       patterns:
-        - "handlers/dataframes.py"
+        - "handlers/get_dataframe.py"
     layers:
       - {Ref: DependenciesLambdaLayer}
     events:
       - http:
-          path: dataframes/get/{name}
+          path: dataframes/{dataframe_id}/get
           method: get
           authorizer:
             type: COGNITO_USER_POOLS
@@ -112,7 +122,7 @@ functions:
           request:
             parameters:
               paths:
-                name: true
+                dataframe_id: true
               querystrings:
                 external_key: false
                 use_last: false
@@ -157,48 +167,6 @@ functions:
           authorizer:
             type: COGNITO_USER_POOLS
             authorizerId: !Ref ApiGatewayAuthorizer
-          cors: true
-          
-  getDataframeDates:
-    handler: handlers/dataframe_dates.list_dates
-    timeout: 30
-    memorySize: 128
-    package:
-      patterns:
-        - "handlers/dataframe_dates.py"
-    layers:
-      - {Ref: DependenciesLambdaLayer}
-    environment:
-      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-dates
-    events:
-      - http:
-          path: dataframesDates/{name}
-          method: get
-          authorizer:
-            type: COGNITO_USER_POOLS
-            authorizerId: !Ref ApiGatewayAuthorizer
-            identitySource: method.request.header.Authorization
-          cors: true
-
-  getDataframeChunksSize:
-    handler: handlers/dataframe_chunks_size.get
-    timeout: 30
-    memorySize: 128
-    package:
-      patterns:
-        - "handlers/dataframe_chunks_size.py"
-    layers:
-      - {Ref: DependenciesLambdaLayer}
-    environment:
-      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-dates
-    events:
-      - http:
-          path: dataframeChunksSize/{name}
-          method: get
-          authorizer:
-            type: COGNITO_USER_POOLS
-            authorizerId: !Ref ApiGatewayAuthorizer
-            identitySource: method.request.header.Authorization
           cors: true
 
 resources:
