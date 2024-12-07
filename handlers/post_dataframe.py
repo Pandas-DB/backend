@@ -8,6 +8,7 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
 
 from .utils.validators import validate_request
+from .utils.utils import create_response
 
 logger = Logger()
 tracer = Tracer()
@@ -16,18 +17,6 @@ tracer = Tracer()
 class UploadError(Exception):
     """Custom exception for upload operations"""
     pass
-
-
-def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Create API Gateway response with CORS headers"""
-    return {
-        'statusCode': status_code,
-        'body': json.dumps(body),
-        'headers': {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
-        }
-    }
 
 
 def handle_init_upload(s3, bucket, key) -> Dict[str, Any]:

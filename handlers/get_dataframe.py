@@ -1,6 +1,5 @@
 import boto3
 import json
-import os
 from datetime import datetime, timedelta
 from io import StringIO
 from requests.utils import unquote
