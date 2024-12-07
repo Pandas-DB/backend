@@ -20,7 +20,7 @@ tracer = Tracer()
 
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
-LOCK_TABLE = "dataframe-storage-system-events-lock"
+LOCK_TABLE = os.environ['LOCK_TABLE']
 
 
 class Lock:

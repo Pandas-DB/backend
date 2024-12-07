@@ -61,6 +61,13 @@ provider:
             - cognito-idp:AdminInitiateAuth
             - cognito-idp:AdminCreateUser
           Resource: "arn:aws:cognito-idp:${self:provider.region}:*:userpool/*"
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:UpdateItem
+          Resource: "arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.LOCK_TABLE}"
 
 package:
   individually: true
@@ -201,7 +208,7 @@ functions:
           cors: true
 
   eventConsumer:
-    handler: handlers/event_consumer.handler
+    handler: handlers/post_event_consumer.handler
     timeout: 300
     memorySize: 512
     package:
@@ -216,7 +223,7 @@ functions:
       - sqs:
           arn: !GetAtt EventsQueue.Arn
           batchSize: 20  # 20 items buffer
-          maximumBatchingWindow: 300  # 5 minutes after receiving an event before trigger the next lambda
+          maximumBatchingWindow: 60  # 1 minute after receiving an event before trigger the next lambda
           functionResponseType: ReportBatchItemFailures
           maximumBatchSize: 2097152  # 2MB
 
