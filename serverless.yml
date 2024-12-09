@@ -8,7 +8,6 @@ provider:
   
   environment:
     METADATA_TABLE: ${self:service}-${self:provider.stage}
-    LOCK_TABLE: ${self:service}-events-lock-${self:provider.stage}
     CHUNK_SIZE: 100000
     POWERTOOLS_SERVICE_NAME: ${self:service}
     LOG_LEVEL: INFO
@@ -20,15 +19,6 @@ provider:
   iam:
     role:
       statements:
-        - Effect: Allow
-          Action:
-            - sqs:SendMessage
-            - sqs:SendMessageBatch
-            - sqs:ReceiveMessage
-            - sqs:DeleteMessage
-            - sqs:DeleteMessageBatch
-            - sqs:GetQueueAttributes
-          Resource: !GetAtt EventsQueue.Arn
         - Effect: Allow
           Action:
             - dynamodb:Query
@@ -61,13 +51,6 @@ provider:
             - cognito-idp:AdminInitiateAuth
             - cognito-idp:AdminCreateUser
           Resource: "arn:aws:cognito-idp:${self:provider.region}:*:userpool/*"
-        - Effect: Allow
-          Action:
-            - dynamodb:GetItem
-            - dynamodb:PutItem
-            - dynamodb:DeleteItem
-            - dynamodb:UpdateItem
-          Resource: "arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.LOCK_TABLE}"
 
 package:
   individually: true
@@ -186,47 +169,6 @@ functions:
             authorizerId: !Ref ApiGatewayAuthorizer
           cors: true
 
-  updateDataFrame:
-    handler: handlers/update_dataframe.handler
-    timeout: 30
-    memorySize: 256
-    package:
-      patterns:
-        - "handlers/update_dataframe.py"
-    layers:
-      - {Ref: DependenciesLambdaLayer}
-    environment:
-      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-events-producer
-      EVENTS_QUEUE_URL: !Ref EventsQueue
-    events:
-      - http:
-          path: dataframes/{dataframe_id}/event-upload
-          method: post
-          authorizer:
-            type: COGNITO_USER_POOLS
-            authorizerId: !Ref ApiGatewayAuthorizer
-          cors: true
-
-  eventConsumer:
-    handler: handlers/post_event_consumer.handler
-    timeout: 300
-    memorySize: 512
-    package:
-      patterns:
-        - "handlers/post_event_consumer.py"
-    layers:
-      - {Ref: DependenciesLambdaLayer}
-    environment:
-      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-events-consumer
-      EVENTS_QUEUE_URL: !Ref EventsQueue
-    events:
-      - sqs:
-          arn: !GetAtt EventsQueue.Arn
-          batchSize: 20  # 20 items buffer
-          maximumBatchingWindow: 60  # 1 minute after receiving an event before trigger the next lambda
-          functionResponseType: ReportBatchItemFailures
-          maximumBatchSize: 2097152  # 2MB
-
   deleteFolder:
     handler: handlers/delete_folder.delete_folder
     timeout: 300
@@ -314,57 +256,6 @@ resources:
         ResponseType: DEFAULT_5XX
         RestApiId: !Ref ApiGatewayRestApi
 
-    EventsQueue:
-      Type: AWS::SQS::Queue
-      Properties:
-        QueueName: ${self:service}-events-${self:provider.stage}
-        VisibilityTimeout: 360
-        MessageRetentionPeriod: 1209600  # 14 days
-        ReceiveMessageWaitTimeSeconds: 20
-        MaximumMessageSize: 262144  # 256KB
-        RedrivePolicy:
-          deadLetterTargetArn: !GetAtt EventsDLQ.Arn
-          maxReceiveCount: 3
-
-    EventsDLQ:
-      Type: AWS::SQS::Queue
-      Properties:
-        QueueName: ${self:service}-events-dlq-${self:provider.stage}
-        MessageRetentionPeriod: 1209600  # 14 days
-
-    EventsLockTable:
-      Type: AWS::DynamoDB::Table
-      Properties:
-        TableName: ${self:provider.environment.LOCK_TABLE}
-        AttributeDefinitions:
-          - AttributeName: lockKey
-            AttributeType: S
-        KeySchema:
-          - AttributeName: lockKey
-            KeyType: HASH
-        BillingMode: PAY_PER_REQUEST
-        TimeToLiveSpecification:
-          AttributeName: expiresAt
-          Enabled: true
-
-    EventsScheduleRule:
-      Type: AWS::Events::Rule
-      Properties:
-        Description: "Trigger event processing every 30 minutes"
-        ScheduleExpression: "rate(30 minutes)"
-        State: ENABLED
-        Targets:
-          - Arn: !GetAtt EventConsumerLambdaFunction.Arn
-            Id: "ProcessEventsSchedule"
-
-    EventsSchedulePermission:
-      Type: AWS::Lambda::Permission
-      Properties:
-        FunctionName: !GetAtt EventConsumerLambdaFunction.Arn
-        Action: lambda:InvokeFunction
-        Principal: events.amazonaws.com
-        SourceArn: !GetAtt EventsScheduleRule.Arn
-
   Outputs:
     UserPoolId:
       Value: !Ref CognitoUserPool
@@ -372,7 +263,3 @@ resources:
       Value: !Ref CognitoUserPoolClient
     ApiUrl:
       Value: !Sub https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}
-    EventsQueueUrl:
-      Value: !Ref EventsQueue
-    EventsQueueArn:
-      Value: !GetAtt EventsQueue.Arn
