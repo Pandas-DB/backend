@@ -1,7 +1,7 @@
 import boto3
 import json
 from datetime import datetime, timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from requests.utils import unquote
 import uuid
 from typing import Dict, Any
@@ -9,6 +9,7 @@ from botocore.exceptions import ClientError
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from aws_lambda_powertools.utilities.data_classes import APIGatewayProxyEvent
+import pandas as pd
 
 from .utils.validators import validate_request
 from .utils.exceptions import ValidationError
@@ -52,6 +53,38 @@ def schedule_cleanup(bucket: str, key: str, s3_client) -> None:
         # Continue execution as this is not critical
 
 
+def get_column_names(s3, bucket: str, key: str) -> list:
+    """Get column names from Parquet file using S3 Select"""
+    try:
+        resp = s3.select_object_content(
+            Bucket=bucket,
+            Key=key,
+            ExpressionType='SQL',
+            Expression="SELECT * FROM s3object LIMIT 1",
+            InputSerialization={
+                'Parquet': {},
+                'CompressionType': 'NONE',
+            },
+            OutputSerialization={
+                'JSON': {
+                    'RecordDelimiter': '\n'
+                }
+            }
+        )
+
+        # Process the response to get the first record
+        for event in resp['Payload']:
+            if 'Records' in event:
+                json_str = event['Records']['Payload'].decode('utf-8')
+                record = json.loads(json_str)
+                return list(record.keys())
+
+        return []  # Return empty list if no records found
+    except Exception as e:
+        logger.error(f"Failed to get column names: {str(e)}")
+        return []
+
+
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
 def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[str, Any]:
@@ -88,9 +121,9 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
         if not key:
             raise ValidationError("Key parameter is required")
 
-        # Append data.csv if not already present
-        if not key.endswith('.csv'):
-            key = f"{key.rstrip('/')}/data.csv"
+        # Append data.parquet if not already present
+        if not key.endswith('.parquet'):
+            key = f"{key.rstrip('/')}/data.parquet"
         logger.info(f"Final key: {key}")
 
         # Extract and validate parameters
@@ -117,6 +150,10 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
             logger.error(f"S3 error checking file: {str(e)}")
             raise
 
+        # Get column names first
+        column_names = get_column_names(s3, bucket, key)
+        logger.info(f"Retrieved columns: {column_names}")
+
         # Generate temporary file key
         temp_key = create_temp_key()
 
@@ -133,25 +170,35 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
             Key=key,
             ExpressionType='SQL',
             Expression=query,
-            InputSerialization={'CSV': {'FileHeaderInfo': 'USE'}},
+            InputSerialization={
+                'Parquet': {},
+                'CompressionType': 'NONE',
+            },
             OutputSerialization={'CSV': {}}
         )
+        logger.info('Get query done!')
 
-        # Process the streaming response
         parts = []
         part_number = 1
-        current_part = StringIO()
+        current_part = BytesIO()
         bytes_processed = 0
+
+        if column_names:
+            header_row = ','.join(f'"{col}"' for col in column_names) + '\n'
+            current_part.write(header_row.encode('utf-8'))
+            bytes_processed += len(header_row)
 
         for event_dict in resp['Payload']:
             if 'Records' in event_dict:
                 data = event_dict['Records']['Payload']
-                current_part.write(data.decode('utf-8'))
+                current_part.write(data)
                 bytes_processed += len(data)
 
                 # Upload part when it reaches threshold (~5MB)
                 if current_part.tell() >= 5 * 1024 * 1024:
+                    logger.info(f'data size: {current_part.tell()}')
                     current_part.seek(0)
+
                     part = s3.upload_part(
                         Body=current_part.getvalue(),
                         Bucket=bucket,
@@ -167,10 +214,7 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
 
                     logger.info(f"Uploaded part {part_number}, size: {current_part.tell()} bytes")
                     part_number += 1
-                    current_part = StringIO()
-
-            elif 'Stats' in event_dict:
-                logger.info(f"Query stats: {event_dict['Stats']}")
+                    current_part = BytesIO()
 
         # Upload final part if any data remains
         if current_part.tell() > 0:
@@ -210,6 +254,8 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
             ExpiresIn=3600  # 1 hour
         )
 
+        logger.info(f"Prepared presigned URL, last 5 characters: {url[-5:]}")
+
         # Schedule cleanup
         schedule_cleanup(bucket, temp_key, s3)
 
@@ -219,7 +265,8 @@ def get_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[s
                 'download_url': url,
                 'expires_in': 3600,
                 'query': query,
-                'bytes_processed': bytes_processed
+                'bytes_processed': bytes_processed,
+                'columns': column_names  # Include columns in response
             }),
             'headers': {
                 'Content-Type': 'application/json',

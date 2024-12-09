@@ -1,5 +1,6 @@
 from typing import Dict, Any
 from json import dumps
+from re import sub
 
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:

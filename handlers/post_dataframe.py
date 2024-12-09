@@ -109,9 +109,9 @@ def post_dataframe(event: APIGatewayProxyEvent, context: LambdaContext) -> Dict[
         if not key:
             return create_response(400, {'error': 'Key parameter is required'})
 
-        # Append data.csv if not already present
-        if not key.endswith('.csv'):
-            key = f"{key.rstrip('/')}/data.csv"
+        # Append data.parquet if not already present
+        if not key.endswith('.parquet'):
+            key = f"{key.rstrip('/')}/data.parquet"
 
         body = json.loads(event.get('body')) if event.get('body') else None
         upload_id = body.get('upload_id') if body else None

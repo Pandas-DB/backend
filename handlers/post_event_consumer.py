@@ -1,4 +1,4 @@
-# handlers/event_consumer.py
+# handlers/post_event_consumer.py
 import json
 import os
 import boto3
@@ -10,7 +10,7 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
 from botocore.exceptions import ClientError
 from typing import List, Dict, Any
 from boto3.dynamodb.conditions import Attr
-from io import StringIO
+from io import BytesIO
 import pandas as pd
 
 from .utils.exceptions import LockAcquisitionError
@@ -87,7 +87,7 @@ def append_events_to_s3(bucket: str, key: str, events: List[Dict]) -> None:
             # Try to get existing content
             try:
                 response = s3.get_object(Bucket=bucket, Key=key)
-                existing_content = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+                existing_content = pd.read_parquet(BytesIO(response['Body'].read()))
             except ClientError as e:
                 if e.response['Error']['Code'] == 'NoSuchKey':
                     logger.info(f"No existing file found at {key}, creating new one")
@@ -106,14 +106,15 @@ def append_events_to_s3(bucket: str, key: str, events: List[Dict]) -> None:
 
             # Write back to S3
             try:
-                csv_buffer = StringIO()
-                all_events_df.to_csv(csv_buffer, index=False)
+                parquet_buffer = BytesIO()
+                all_events_df.to_parquet(parquet_buffer, index=False)
+                parquet_buffer.seek(0)
 
                 s3.put_object(
                     Bucket=bucket,
                     Key=key,
-                    Body=csv_buffer.getvalue(),
-                    ContentType='text/csv'
+                    Body=parquet_buffer.getvalue(),
+                    ContentType='application/x-parquet'
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to write to S3: {str(e)}")
@@ -168,8 +169,8 @@ def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
                 continue
 
             # Append data.csv if not already present
-            if not key.endswith('.csv'):
-                key = f"{key.rstrip('/')}/data.csv"
+            if not key.endswith('.parquet'):
+                key = f"{key.rstrip('/')}/data.parquet"
 
             try:
                 # Process the event data
