@@ -227,6 +227,30 @@ functions:
           functionResponseType: ReportBatchItemFailures
           maximumBatchSize: 2097152  # 2MB
 
+  deleteFolder:
+    handler: handlers/delete_folder.delete_folder
+    timeout: 300
+    memorySize: 256
+    package:
+      patterns:
+        - "handlers/delete_folder.py"
+    layers:
+      - { Ref: DependenciesLambdaLayer }
+    environment:
+      POWERTOOLS_METRICS_NAMESPACE: ${self:service}-delete
+    events:
+      - http:
+          path: dataframes/{dataframe_id}/delete
+          method: delete
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+          cors: true
+          request:
+            parameters:
+              paths:
+                dataframe_id: true
+
 resources:
   Resources:
     MetadataTable:
